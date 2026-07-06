@@ -182,6 +182,15 @@ const Screen4 = {
     send.addEventListener("click", doAsk);
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") doAsk(); });
     wrap.appendChild(el("div", { class: "row mt8" }, [input, send]));
+    // Execute: turn the diagnosis into a Draft Proposal (still not an immediate change).
+    const exec = el("button", {
+      class: "btn btn-sm btn-accent mt8", style: "width:100%",
+      text: "⚡ Execute → draft a version from this chat",
+      onclick: () => this.executeFromChat(),
+    });
+    wrap.appendChild(exec);
+    wrap.appendChild(el("div", { class: "faint mt8", style: "font-size:11px",
+      text: "Execute asks the LLM to turn this discussion into a Draft Proposal — you still review & Accept it." }));
     return wrap;
   },
   msg(m) {
@@ -212,6 +221,10 @@ const Screen4 = {
   async steer(action, note, need2) {
     if (!this.selCandA && action !== "merge") { toast("Select a candidate first", "bad"); return; }
     if (need2 && !this.selCandB) { toast("Cross-mutate needs Branch B — use ‘Set A as Branch B’ on a second node", "bad"); return; }
+    // Open the drawer immediately with a loading state (live steering makes a
+    // few Gemini calls and can take ~10-30s — don't leave the user staring).
+    this.currentProposal = null;
+    this.showDrawerLoading(action.replace("_", "-"));
     try {
       const res = await API.steer({
         experiment_id: this.expId, action,
@@ -220,9 +233,32 @@ const Screen4 = {
         version_id: this.selectedVersionId, note,
       });
       this.currentProposal = res.proposal;
-      this.openDrawer();
+      this.fillDrawer(this._drawer, this.currentProposal);
       toast("Draft proposal created", "good");
-    } catch (e) { toast("Steer failed: " + e.message, "bad"); }
+    } catch (e) {
+      this.closeDrawer();
+      toast("Steer failed: " + e.message, "bad");
+    }
+  },
+  async executeFromChat() {
+    if (!this.chatLog.length) {
+      toast("Ask something first, then Execute to draft a change from the chat", "bad");
+      return;
+    }
+    this.currentProposal = null;
+    this.showDrawerLoading("chat-driven");
+    try {
+      const res = await API.chatSteer({
+        experiment_id: this.expId, messages: this.chatLog,
+        candidate_id: this.selCandA, version_id: this.selectedVersionId,
+      });
+      this.currentProposal = res.proposal;
+      this.fillDrawer(this._drawer, this.currentProposal);
+      toast("Draft proposal created from chat", "good");
+    } catch (e) {
+      this.closeDrawer();
+      toast("Execute failed: " + e.message, "bad");
+    }
   },
   steerFromVersion(v, action) {
     const cands = this.versionCandidates(v.id);
@@ -314,6 +350,24 @@ const Screen4 = {
     this.fillDrawer(this._drawer, this.currentProposal);
     this._drawer.classList.add("open");
   },
+  showDrawerLoading(kind) {
+    const d = this._drawer;
+    d.innerHTML = "";
+    d.appendChild(el("div", { class: "drawer-head" }, [
+      el("div", {}, [
+        el("div", { class: "section-title", text: "Draft Proposal" }),
+        el("h3", { style: "margin:2px 0", text: "Generating…" }),
+      ]),
+      el("button", { class: "btn btn-xs btn-ghost", text: "✕", onclick: () => this.closeDrawer() }),
+    ]));
+    d.appendChild(el("div", { class: "drawer-body" }, [
+      el("div", { class: "empty", html:
+        `<span class="spinner"></span>
+         <div class="mt12">Drafting the ${kind || ""} proposal…</div>
+         <div class="faint mt8" style="font-size:12px">The LLM is writing and validating a program — this can take a few seconds.</div>` }),
+    ]));
+    d.classList.add("open");
+  },
   closeDrawer() { this._drawer.classList.remove("open"); },
   fillDrawer(d, p) {
     d.innerHTML = "";
@@ -359,21 +413,38 @@ const Screen4 = {
   },
   renderTestResult(r) {
     const wrap = el("div", { class: "card", style: "padding:10px;margin-top:6px" });
-    wrap.appendChild(el("div", { class: "lbl", text: "Cheap test result" }));
+    wrap.appendChild(el("div", { class: "row", style: "justify-content:space-between;align-items:center" }, [
+      el("div", { class: "lbl", text: "Cheap test result" }),
+      r.kind === "prune" ? null
+        : el("span", { class: "pill " + (r.invalid ? "pill-bad" : "pill-good"),
+                       text: r.invalid ? "invalid" : "valid" }),
+    ]));
     wrap.appendChild(el("div", { class: "muted", style: "font-size:12.5px", text: r.note || "" }));
-    if (r.construction) wrap.appendChild(el("div", { class: "viz-large mt8", html: renderConstruction(r.construction, { size: 200 }) }));
-    if (r.history) wrap.appendChild(el("div", { class: "chart-wrap mt8", html: lineChart(r.history, { w: 340, h: 120, color: "var(--good)" }) }));
+    // Always render a preview when we have a construction (even an invalid one).
+    const constr = r.construction;
+    if (constr && constr.circles && constr.circles.length) {
+      wrap.appendChild(el("div", { class: "section-title mt8", text: "Preview (rendered from construction)" }));
+      wrap.appendChild(el("div", { class: "viz-large mt8", html: renderConstruction(constr, { size: 200, invalid: !!r.invalid }) }));
+    } else if (r.kind !== "prune") {
+      wrap.appendChild(el("div", { class: "empty mt8", text: "No construction produced." }));
+    }
+    if (r.history) wrap.appendChild(el("div", { class: "chart-wrap mt8", html: lineChart(r.history, { w: 340, h: 120, color: r.invalid ? "var(--bad)" : "var(--good)" }) }));
     return wrap;
   },
   async runProposalTest(p, btn) {
     btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Testing…`;
+    const area = document.getElementById("prop-test-area");
+    if (area) area.innerHTML = `<div class="empty"><span class="spinner"></span><div class="mt8 faint" style="font-size:12px">Running the proposed program…</div></div>`;
     try {
       const res = await API.proposalTest(p.id);
       this.currentProposal = res.proposal;
-      const area = document.getElementById("prop-test-area");
-      area.innerHTML = ""; area.appendChild(this.renderTestResult(res.result));
+      const a = document.getElementById("prop-test-area");
+      if (a) { a.innerHTML = ""; a.appendChild(this.renderTestResult(res.result)); }
       toast("Cheap test complete", "good");
-    } catch (e) { toast("Test failed: " + e.message, "bad"); }
+    } catch (e) {
+      if (area) area.innerHTML = "";
+      toast("Test failed: " + e.message, "bad");
+    }
     finally { btn.disabled = false; btn.innerHTML = "▶ Run Cheap Test"; }
   },
   async viewProposalDiff(p) {
@@ -386,18 +457,28 @@ const Screen4 = {
     ]));
   },
   async acceptProposal(p) {
+    const btn = this._drawer.querySelector(".drawer-foot .btn-primary");
+    if (btn) { btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Committing…`; }
     try {
       const res = await API.proposalAccept(p.id);
       this.closeDrawer();
       this.currentProposal = null;
-      if (res.pruned) { toast(`Pruned ${res.pruned.length} candidate(s)`, "good"); }
-      else if (res.version) {
-        this.selectedVersionId = res.version.id;
-        this.selCandA = res.best_candidate && res.best_candidate.id;
-        toast(`Accepted → new version ${res.version.label} committed`, "good");
+      if (res.pruned) {
+        toast(`Pruned ${res.pruned.length} candidate(s)`, "good");
+        await this.load(document.querySelector(".view > div"));
+        return;
       }
-      await this.load(document.querySelector(".view > div"));
-    } catch (e) { toast("Accept failed: " + e.message, "bad"); }
+      if (res.version) {
+        // New version created → go to the dashboard and watch its trials live.
+        toast(`Accepted → ${res.version.label} committed; running its trials live`, "good");
+        State.currentExperimentId = res.experiment_id;
+        State.focusVersionId = res.version.id;
+        navigate(`#/experiment/${res.experiment_id}`);
+      }
+    } catch (e) {
+      toast("Accept failed: " + e.message, "bad");
+      if (btn) { btn.disabled = false; btn.innerHTML = "✓ Accept"; }
+    }
   },
   async cancelProposal(p) {
     try { await API.proposalDiscard(p.id); } catch (e) {}

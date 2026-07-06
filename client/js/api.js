@@ -19,6 +19,7 @@ const API = {
     return r.json();
   },
   status: () => API.get("/api/status"),
+  setMode: (mock) => API.post("/api/mode", { mock }),
   experiments: () => API.get("/api/experiments"),
   configure: (b) => API.post("/api/configure", b),
   testRun: (b) => API.post("/api/test-run", b),
@@ -35,6 +36,7 @@ const API = {
   proposalAccept: (id) => API.post(`/api/proposal/${id}/accept`, {}),
   proposalDiscard: (id) => API.post(`/api/proposal/${id}/discard`, {}),
   chat: (b) => API.post("/api/chat", b),
+  chatSteer: (b) => API.post("/api/chat/steer", b),
 };
 
 /* Small DOM helpers -------------------------------------------------------- */

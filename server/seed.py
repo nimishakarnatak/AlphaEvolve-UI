@@ -44,7 +44,8 @@ def seed_demo():
         note="Baseline: square-grid seeding + radius inflation.",
     )
     exp.root_version_id = v1.id
-    _c1, best1 = evo.build_candidate_tree(v1, exp.n_circles, "grid", seed=11, count=16)
+    _c1, best1 = evo.build_candidate_tree(v1, exp.n_circles, "grid", seed=11, count=16,
+                                          deterministic=True)
 
     # -- v2: fork from best of v1 (spiral seeding) --------------------------
     v2 = STORE.add_version(
@@ -56,7 +57,8 @@ def seed_demo():
                                            evo.program_variant("spiral", 8)),
         note="Forked from v1's best candidate; switched to sunflower seeding.",
     )
-    _c2, best2 = evo.build_candidate_tree(v2, exp.n_circles, "spiral", seed=23, count=14)
+    _c2, best2 = evo.build_candidate_tree(v2, exp.n_circles, "spiral", seed=23, count=14,
+                                          deterministic=True)
     best1.forked_into_version_id = v2.id
     v2.score_deltas_per_metric = {
         m: round(best2.scores_per_metric.get(m, 0) - best1.scores_per_metric.get(m, 0), 4)
@@ -72,7 +74,8 @@ def seed_demo():
                                            evo.program_variant("hex", 10, 0.6)),
         note="Explored more like v2's best branch with hexagonal seeding.",
     )
-    _c3, best3 = evo.build_candidate_tree(v3, exp.n_circles, "hex", seed=31, count=12)
+    _c3, best3 = evo.build_candidate_tree(v3, exp.n_circles, "hex", seed=31, count=12,
+                                          deterministic=True)
     best2.forked_into_version_id = v3.id
     v3.score_deltas_per_metric = {
         m: round(best3.scores_per_metric.get(m, 0) - best2.scores_per_metric.get(m, 0), 4)
@@ -88,7 +91,8 @@ def seed_demo():
                                            evo.program_variant("concentric", 9)),
         note="Cross-mutated v2 and v3: concentric rings blending both layouts.",
     )
-    _c4, best4 = evo.build_candidate_tree(v4, exp.n_circles, "concentric", seed=43, count=13)
+    _c4, best4 = evo.build_candidate_tree(v4, exp.n_circles, "concentric", seed=43, count=13,
+                                          deterministic=True)
     v4.score_deltas_per_metric = {
         m: round(best4.scores_per_metric.get(m, 0) - best3.scores_per_metric.get(m, 0), 4)
         for m in evo.METRICS}
@@ -116,7 +120,9 @@ def seed_demo():
     )
 
     # -- Pre-computed short runs so Screen 2 is populated -------------------
-    evo.launch_short_runs(exp, n_runs=4)
+    # deterministic=True keeps startup instant/offline even when a key is set;
+    # user-triggered short runs (Screen 2) go through the live path in live mode.
+    evo.launch_short_runs(exp, n_runs=4, deterministic=True)
 
     return exp
 

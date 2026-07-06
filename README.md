@@ -69,9 +69,54 @@ startup, so all four screens are populated with zero setup.
 
 ---
 
+## Deploy (Render)
+
+This is a **stateful** Flask app — it holds the program/version database in
+memory and streams evolution runs over **SSE** from background threads — so it
+needs a host that runs a persistent Python process (Render, Railway, Fly.io).
+Static/serverless hosts like **Netlify or Vercel can't run the backend** (no
+long-lived process, function timeouts kill SSE, stateless functions lose the
+in-memory store, and it executes code in subprocesses). A `render.yaml`
+Blueprint is included.
+
+**Steps:**
+1. Push to GitHub (the `.gitignore` keeps `.env` out — never commit your key).
+2. Render → **New → Blueprint** → pick this repo. It reads `render.yaml`.
+3. In the service's **Environment**, set the secret values (they're `sync:false`
+   in the blueprint, so Render prompts for them):
+   - `GEMINI_API_KEY` — your key (live mode).
+   - `APP_PASSWORD` — a password; the whole site then requires HTTP Basic Auth
+     (user `admin` by default via `APP_USERNAME`). **Set this** — see the
+     security note below.
+4. Deploy. The service runs `gunicorn` with **one threaded worker** (required:
+   the in-memory store + SSE must share one process).
+
+To deploy as an **offline demo instead** (no key, no code execution, no cost):
+set `MOCK_MODE=true` and leave `GEMINI_API_KEY` unset.
+
+> **Security — read before making it public.** In live mode the app executes
+> Gemini-written Python in a subprocess. The denylist in `executor.py` is a
+> guard, **not a sandbox**. Anyone who can reach a live deployment can trigger
+> code execution, so **always set `APP_PASSWORD`** on a public live deployment
+> (or deploy in mock mode). The included Basic-Auth gate covers the whole site,
+> API and SSE included. `APP_PASSWORD` unset = fully open (fine for localhost).
+
+`gunicorn` is Linux-only; keep running `python server/app.py` locally on Windows.
+If SSE ever misbehaves behind gunicorn, the built-in server also works on Render
+via start command `python server/app.py` with `HOST=0.0.0.0`.
+
+---
+
 ## Mock vs. live mode
 
-A single flag, `MOCK_MODE`, controls everything.
+**Toggle in the app:** click the mode badge in the top-right (`mock mode ⇄` /
+`live · gemini-2.5-flash ⇄`) to switch at runtime — no restart, no env editing.
+Going live requires a key on the server; without `GEMINI_API_KEY` the toggle
+stays on mock and says so. The badge also polls the server every few seconds, so
+it always reflects the real mode.
+
+The initial mode is still controlled by the `MOCK_MODE` flag / `GEMINI_API_KEY`
+below; the badge just flips it live afterwards.
 
 | Mode | How | Behavior |
 |------|-----|----------|
@@ -94,16 +139,39 @@ export GEMINI_API_KEY=your-key-here
 
 If `MOCK_MODE=false` but no key is present, the app transparently falls back to
 mock so it never crashes. Optional: `GEMINI_MODEL` (default `gemini-2.5-flash`),
-`GEMINI_BASE_URL`, `HOST`, `PORT`.
+`GEMINI_BASE_URL`, `GEMINI_REASONING_EFFORT` (default `none` — disables Gemini
+2.5 "thinking" so long code responses aren't truncated), `HOST`, `PORT`.
 
-**Live LLM call sites** (each with a mock fallback):
-1. `POST /api/configure` — scaffold title/description/metrics from a prompt.
-2. `POST /api/test-run` — the reward-hack / spec **critique** on the cheap test.
-3. `POST /api/chat` — read-only Ask/Diagnose answers.
+### Live mode is genuinely LLM-driven (no mocks)
 
-Candidate AI summaries, code diffs, and the evolution itself are deterministic
-(mock) in both modes to keep API usage bounded — see the note in
-`server/evolution.py`.
+In live mode there are **no canned responses** — every screen is powered by real
+Gemini calls plus real code execution:
+
+| Where | What happens live |
+|-------|-------------------|
+| **Screen 1 · Configure** | Gemini scaffolds the title/description/metrics **and writes** the initial program, eval function, and visualization code. |
+| **Screen 1 · Cheap Test** | The generated `construct_packing` program is **executed in a subprocess** and scored by a trusted geometry evaluator; Gemini critiques the setup for reward-hacks. |
+| **Screen 2 · Short Runs** | Each card is a **real Gemini-written program**, executed over several seeds. Weak/invalid programs are retried with the error fed back; if a strategy still can't produce a good valid packing, the card falls back to a validated deterministic one (clearly labelled *(fallback)*) so no card is ever empty or zero. |
+| **Screen 3 · Full Run** | Each streamed generation, Gemini **rewrites the program**; we run + evaluate it and stream the result over SSE (AlphaEvolve's loop). |
+| **Screen 4 · Steer/Accept** | Proposals + programs are Gemini-authored (retried until the program is a valid full packing); **Run Cheap Test** in the draft drawer executes the proposed program over several seeds. **Accept** commits the new version, then jumps to the dashboard and **streams that version's trials live** (a real evolutionary run on the new program). |
+| **Chat** | Read-only Ask/Diagnose answers from Gemini. |
+
+Execution safety: LLM code runs in a subprocess with a timeout and a denylist
+for obviously unsafe calls (`os`, `subprocess`, `open`, `eval`, network, …).
+Scores always come from a **trusted in-process evaluator**, so a model can't
+reward-hack by writing its own eval. Programs that error or produce invalid
+packings become real **error nodes** (the artifact/error side-channel).
+
+Honest live behavior: Gemini Flash is not a strong numeric optimizer, so live
+runs vary — some programs fail or score below the deterministic baseline, and
+occasionally one beats it. That's the real evolutionary signal, not a scripted
+demo.
+
+The **seeded demo experiment** (`exp_1`) is deterministic fixture data so the
+app is populated instantly at startup even with a key set (`deterministic=True`
+in `seed.py`). Every *interaction* on it — start a run, steer, cheap-test,
+relaunch short runs, chat — is fully live. On a transient API error the live
+path degrades to the valid baseline program (never to fixture text).
 
 ---
 
@@ -154,7 +222,9 @@ and pre-computed short runs.
   Merge), which create a **Draft Proposal** (not an immediate change).
 - **Draft Proposal drawer** (right): proposed new version, specific changes,
   files affected, and *View Diff / Run Cheap Test / Accept / Cancel*. Accept
-  commits a new `ExperimentVersion` with full provenance.
+  commits a new `ExperimentVersion` with full provenance, then **jumps to the
+  dashboard (Screen 3) and streams that version's trials live** (a fresh
+  evolutionary run seeded from the new program).
 - **Compare / Diff:** real line-level (LCS / GitHub-style) side-by-side diff of
   two versions with a change summary and normalized score delta.
 
@@ -209,7 +279,8 @@ alphaevolve-ui/
 │  ├─ store.py          data model (dataclasses) + in-memory store + SSE pub/sub
 │  ├─ evolution.py      lightweight, mockable evolution (parent sampling, steering,
 │  │                    proposals, configure, critique, chat) — mirrors OpenEvolve's shape
-│  ├─ packing.py        deterministic offline circle-packing optimizer (constructions)
+│  ├─ packing.py        deterministic offline circle-packing optimizer (mock constructions)
+│  ├─ executor.py       live mode: run LLM-written programs in a subprocess + trusted evaluator
 │  ├─ diffutil.py       LCS line diff
 │  ├─ seed.py           seeds the fully-populated demo on startup
 │  └─ requirements.txt
@@ -223,11 +294,15 @@ alphaevolve-ui/
 
 ## Notes / simplifications
 
-- The mutation operator is the deterministic packing engine, not a live LLM diff
-  — this keeps the whole app offline, fast, and reproducible while still
-  exercising the real AlphaEvolve/OpenEvolve *shape* (sample parent(s) from a
-  program DB → propose a change → evaluate against the eval function → attach an
-  AI summary → store with scores + construction + visualization → repeat).
+- In **mock mode** the mutation operator is the deterministic packing engine
+  (not a live LLM diff) — offline, fast, reproducible, while still exercising the
+  AlphaEvolve/OpenEvolve *shape* (sample parent(s) → propose a change → evaluate
+  → attach an AI summary → store with scores + construction + visualization →
+  repeat). In **live mode** that same loop is driven by real Gemini program
+  rewrites executed in a subprocess (see the live-mode table above).
+- `server/executor.py` runs LLM-authored code with a timeout + a denylist; it is
+  a pragmatic guard for a local prototype, not a hardened sandbox. Only enable
+  live mode with a key you control.
 - State is in-memory, so a server restart re-seeds the demo.
 - Invalid / reward-hacking candidates (overlapping circles) are generated and
   shown as distinct error nodes, and excluded from the Pareto scatter.

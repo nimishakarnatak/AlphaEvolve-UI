@@ -1,0 +1,34 @@
+# Render Blueprint — deploys the Flask app (API + static client) as one service.
+#
+# Why a single service with ONE worker: the program/version database lives in
+# process memory and evolution runs stream over SSE from background threads, so
+# all requests must share the same process. We use gunicorn's threaded worker
+# (gthread) so one long-lived SSE stream doesn't block other requests.
+#
+# Set the secret env vars (marked sync:false) in the Render dashboard — never in
+# this file: GEMINI_API_KEY and APP_PASSWORD.
+services:
+  - type: web
+    name: alphaevolve-ui
+    runtime: python
+    plan: free
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: >-
+      gunicorn --chdir server --workers 1 --threads 8 --timeout 120
+      --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      # Live mode (you chose live + restricted access). Requires GEMINI_API_KEY.
+      - key: MOCK_MODE
+        value: "false"
+      - key: GEMINI_MODEL
+        value: "gemini-2.5-flash"
+      # Secrets — set these in the Render dashboard, do NOT commit values.
+      - key: GEMINI_API_KEY
+        sync: false
+      # Access gate (HTTP Basic Auth). Without APP_PASSWORD the site is public.
+      - key: APP_USERNAME
+        value: "admin"
+      - key: APP_PASSWORD
+        sync: false

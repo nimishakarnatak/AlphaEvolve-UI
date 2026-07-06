@@ -30,6 +30,29 @@ app = Flask(__name__, static_folder=CLIENT_DIR, static_url_path="")
 
 
 # ---------------------------------------------------------------------------
+# Optional access gate for public deployments.
+#
+# If APP_PASSWORD is set (e.g. on Render), every request requires HTTP Basic
+# Auth — this keeps the public from reaching the API or triggering live code
+# execution. Unset (local dev) => wide open. Works transparently with fetch and
+# EventSource because the browser re-sends cached Basic-Auth credentials.
+# ---------------------------------------------------------------------------
+_APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+_APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
+
+
+@app.before_request
+def _require_auth():
+    if not _APP_PASSWORD:
+        return None
+    auth = request.authorization
+    if auth and auth.username == _APP_USERNAME and auth.password == _APP_PASSWORD:
+        return None
+    return Response("Authentication required.", 401,
+                    {"WWW-Authenticate": 'Basic realm="AlphaEvolve UI"'})
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def body() -> dict:
@@ -84,6 +107,14 @@ def add_headers(resp):
 @app.route("/api/status")
 def api_status():
     return jsonify(config.status_dict())
+
+
+@app.route("/api/mode", methods=["POST"])
+def api_mode():
+    """Flip mock/live at runtime (the in-app toggle). Going live needs a key."""
+    b = body()
+    st = config.set_mock_mode(bool(b.get("mock", True)))
+    return jsonify(st)
 
 
 @app.route("/api/experiments")
@@ -163,6 +194,11 @@ def api_short_runs():
         return jsonify({"error": "experiment not found"}), 404
     existing = [r for r in STORE.experiment_runs(exp.id) if r.kind == "short_test"]
     if not existing or b.get("relaunch"):
+        # Relaunch replaces the previous short runs (avoids mixing fixture +
+        # freshly-generated live runs) so the cards reflect one clean batch.
+        if b.get("relaunch"):
+            for r in existing:
+                STORE.runs.pop(r.id, None)
         existing = evo.launch_short_runs(exp, n_runs=int(b.get("n_runs", 4)))
     runs = [
         {"id": r.id, "strategy": r.strategy, "best_score": r.best_score,
@@ -390,6 +426,20 @@ def api_chat():
         candidate_id=b.get("candidate_id"),
         version_id=b.get("version_id"))
     return jsonify({"answer": answer, "read_only": True})
+
+
+@app.route("/api/chat/steer", methods=["POST"])
+def api_chat_steer():
+    """Turn a read-only diagnosis conversation into a Draft Proposal (Execute)."""
+    b = body()
+    exp = STORE.experiments.get(b.get("experiment_id"))
+    if exp is None:
+        return jsonify({"error": "experiment not found"}), 404
+    result = evo.steer_from_chat(
+        exp, messages=b.get("messages", []),
+        candidate_id=b.get("candidate_id"),
+        version_id=b.get("version_id"), note=b.get("note", ""))
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------

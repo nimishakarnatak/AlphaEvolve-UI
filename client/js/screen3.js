@@ -29,10 +29,19 @@ const Screen3 = {
       return;
     }
     this.candidates = this.exp.candidates;
-    this.viewVersionId = this.currentBestVersionId();
-    // default selection = best candidate
-    this.selected = this.candidates.find((x) => x.id === this.exp.best_candidate_id) ||
-      this.candidates[0] || null;
+    // When arriving from an accepted proposal, focus on that new version and
+    // watch its trials stream in; otherwise focus on the current best version.
+    const focus = State.focusVersionId;
+    State.focusVersionId = null;
+    const hasFocus = focus && this.exp.versions.some((v) => v.id === focus);
+    this.viewVersionId = hasFocus ? focus : this.currentBestVersionId();
+    if (hasFocus) {
+      const vc = this.candidates.filter((x) => x.version_id === focus);
+      this.selected = vc.find((x) => x.is_current_best) || vc[0] || null;
+    } else {
+      this.selected = this.candidates.find((x) => x.id === this.exp.best_candidate_id) ||
+        this.candidates[0] || null;
+    }
     this.build(c);
     if (this.exp.status === "running") this.startStream();
   },
@@ -219,14 +228,26 @@ const Screen3 = {
     return panel;
   },
   versionSelect() {
-    const sel = el("select", { style: "width:auto;min-width:220px" });
+    const sel = el("select", { id: "version-select", style: "width:auto;min-width:220px" });
     this.exp.versions.forEach((v) => {
-      const o = el("option", { value: v.id, text: `${v.label} (${v.origin}) · ${this.candidates.filter((c) => c.version_id === v.id).length} candidates` });
+      const o = el("option", { value: v.id, text: this.versionOptionText(v) });
       if (v.id === this.viewVersionId) o.selected = true;
       sel.appendChild(o);
     });
     sel.addEventListener("change", () => { this.viewVersionId = sel.value; this.drawSubview(this._subviewBody); });
+    this._versionSelect = sel;
     return el("div", { class: "row", style: "gap:6px;align-items:center" }, [el("span", { class: "faint", text: "version" }), sel]);
+  },
+  versionOptionText(v) {
+    const n = this.candidates.filter((c) => c.version_id === v.id).length;
+    return `${v.label} (${v.origin}) · ${n} candidates`;
+  },
+  refreshVersionSelectCounts() {
+    if (!this._versionSelect) return;
+    [...this._versionSelect.options].forEach((o) => {
+      const v = this.exp.versions.find((x) => x.id === o.value);
+      if (v) o.textContent = this.versionOptionText(v);
+    });
   },
   versionCandidates() {
     return this.candidates.filter((c) => c.version_id === this.viewVersionId);
@@ -429,6 +450,7 @@ const Screen3 = {
       if (ev.new_candidate.is_current_best) this.candidates.forEach((x) => x.is_current_best = false);
       this.candidates.push(ev.new_candidate);
       this.setText("ov-candidates", this.candidates.length);
+      this.refreshVersionSelectCounts();
       // re-render active subview + charts
       if (this._subviewBody && this.subview !== "ai") this.drawSubview(this._subviewBody);
       this.refreshCharts();

@@ -34,6 +34,12 @@ GEMINI_BASE_URL = os.getenv(
 )
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+# Gemini 2.5 Flash "thinking" can consume the whole token budget and truncate the
+# visible output (breaking code/JSON responses). Disabling it via the OpenAI-
+# compatible `reasoning_effort` gives complete, faster, cheaper responses. Set to
+# an empty string to leave the model default.
+GEMINI_REASONING_EFFORT = os.getenv("GEMINI_REASONING_EFFORT", "none")
+
 # If MOCK_MODE is off but there is no key, we transparently fall back to mock so
 # the app never crashes on a missing key.
 LIVE_ENABLED = (not MOCK_MODE) and bool(GEMINI_API_KEY)
@@ -54,6 +60,18 @@ FEATURE_DIMENSIONS = ["score", "complexity"]
 # visibly "live" without being slow. Mock mode simulates streaming this way.
 STREAM_STEP_DELAY = 0.35
 
+# ---------------------------------------------------------------------------
+# Live-mode evolution knobs. In live mode every generation is a real Gemini call
+# plus a subprocess execution, so these are much smaller than the mock counts
+# above (which run the instant offline packing engine).
+# ---------------------------------------------------------------------------
+LIVE_SHORT_RUN_SEEDS = 5          # seeds each short-run program is evaluated over
+LIVE_SHORT_RUN_ATTEMPTS = 3       # regeneration attempts (with error feedback) per short run
+LIVE_STEER_ATTEMPTS = 3           # regeneration attempts until a steering proposal is valid
+LIVE_FULL_RUN_GENERATIONS = 8     # streamed LLM generations in a full run
+LIVE_CANDIDATE_COUNT = 5          # candidates built per new version on accept
+LIVE_EXEC_TIMEOUT = 6             # seconds per construction-program subprocess
+
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "5000"))
 
@@ -66,3 +84,16 @@ def status_dict() -> dict:
         "model": GEMINI_MODEL if LIVE_ENABLED else "mock",
         "has_key": bool(GEMINI_API_KEY),
     }
+
+
+def set_mock_mode(mock: bool) -> dict:
+    """Flip mock/live at runtime (used by the in-app toggle).
+
+    Live requires a key: going live with no GEMINI_API_KEY stays mock. All call
+    sites read ``config.LIVE_ENABLED`` at call time, so this takes effect
+    immediately without a restart.
+    """
+    global MOCK_MODE, LIVE_ENABLED
+    MOCK_MODE = bool(mock)
+    LIVE_ENABLED = (not MOCK_MODE) and bool(GEMINI_API_KEY)
+    return status_dict()

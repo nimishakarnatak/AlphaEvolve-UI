@@ -1,12 +1,19 @@
-"""Lightweight, fully-mockable evolution module.
+"""Evolution module with two fully-separate paths.
 
-Mirrors OpenEvolve's shape — sample parent(s) from a program database, ask the
-LLM for a change, apply it, evaluate against the eval function, attach an AI
-summary, store with scores + construction + visualization — but the heavy
-machinery is simplified: the mutation operator is the deterministic circle-
-packing engine (see ``packing.py``), so it runs offline. In live mode the LLM
-call sites (configure / critique / chat) hit Gemini Flash; everything has a mock
-fallback.
+MOCK MODE (default, offline, deterministic): the mutation operator is the
+deterministic circle-packing engine (see ``packing.py``); AI summaries, code
+diffs, and steering text are templated. Nothing calls the network.
+
+LIVE MODE (``config.LIVE_ENABLED``): genuinely LLM-driven, mirroring
+OpenEvolve's shape — Gemini rewrites the ``construct_packing`` program each
+generation, we execute it in a subprocess (see ``executor.py``) and score it
+with a trusted geometry evaluator, and the AI summaries / strategies / code
+diffs / steering proposals / configure code / critique / chat all come from
+Gemini. There are no canned responses on the live path (a transient API error
+degrades to the valid baseline program, not to fixture text).
+
+The two paths never mix: mock code is byte-for-byte unchanged, and the seed
+passes ``deterministic=True`` so startup stays instant even when a key is set.
 """
 from __future__ import annotations
 
@@ -18,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import config
 import gemini_client as gc
 import packing
+import executor
 from diffutil import line_diff, unified_summary
 from store import STORE, Experiment, ExperimentVersion, Candidate
 
@@ -137,11 +145,162 @@ def _sample_parent(pop: List[Tuple], rnd: random.Random):
 
 
 # ---------------------------------------------------------------------------
+# LIVE MODE — genuine LLM-driven evolution (guarded by config.LIVE_ENABLED).
+# Mock mode never enters any of the functions below; the `deterministic` flag
+# lets the seed force the offline path even when a key is present.
+# ---------------------------------------------------------------------------
+def _use_live(deterministic: bool = False) -> bool:
+    return config.LIVE_ENABLED and not deterministic
+
+
+def _zero_scores() -> Dict[str, float]:
+    return {"sum_radii": 0.0, "min_radius": 0.0, "packing_density": 0.0, "valid": 0.0}
+
+
+LIVE_EVOLVE_SYSTEM = (
+    "You are AlphaEvolve, an evolutionary coding agent. You are given a Python "
+    "function construct_packing(n, seed) that returns a list of dicts with keys "
+    "'x','y','r' describing circles in the unit square [0,1]^2. Hard constraints: "
+    "every circle must lie fully inside the square and no two circles may overlap. "
+    "Objective: maximize the sum of the radii. Rewrite the FULL program so it "
+    "scores strictly higher while staying valid. Use ONLY the Python standard "
+    "library (math, random). Do NOT use files, network, os, subprocess or eval. "
+    "Return STRICT JSON with keys: program (the full python source as a string, "
+    "defining construct_packing(n, seed)), summary (one sentence on the approach "
+    "and result), strategy (a short label such as 'hexagonal' or 'physics-relax'), "
+    "code_diff (a short note on what changed vs the current program). JSON only."
+)
+
+
+def _llm_step(exp: Experiment, parent_program: str, parent_scores: Dict,
+              feedback: Optional[str], seed: int, temperature: float = 0.85) -> Dict:
+    """One live mutation: Gemini rewrites the program, we execute + score it.
+
+    Returns a dict with program / construction / scores / summary / strategy /
+    code_diff / error / feedback (error message to feed the next attempt).
+    """
+    user = (
+        f"Problem: {exp.description}\n"
+        f"n = {exp.n_circles} circles.\n\n"
+        f"Current program:\n```python\n{parent_program}\n```\n\n"
+        f"Current best scores: {parent_scores}\n"
+    )
+    if feedback:
+        user += (f"\nThe previous attempt failed or was invalid: {feedback}\n"
+                 "Fix that and improve the score.\n")
+    user += "\nReturn an improved program as JSON."
+    raw = gc.chat(
+        [{"role": "system", "content": LIVE_EVOLVE_SYSTEM},
+         {"role": "user", "content": user}],
+        temperature=temperature, max_tokens=2600,
+    )
+    parsed = gc.extract_json(raw) or {}
+    program = (parsed.get("program") or "").strip()
+    if "def construct_packing" not in program:
+        # model returned a code block (or malformed JSON) — pull the code directly
+        program = gc.extract_code_block(raw) or program or packing.INITIAL_PROGRAM
+    summary = (parsed.get("summary") or "LLM-proposed construction.").strip()
+    strategy = (parsed.get("strategy") or "llm").strip()[:22] or "llm"
+    code_diff = (parsed.get("code_diff") or "(LLM rewrite of construct_packing)").strip()
+
+    res = executor.run_and_eval(program, exp.n_circles, seed)
+    if not res["ok"]:
+        return {"error": True, "program": program,
+                "summary": f"Execution failed: {res['error']}",
+                "strategy": strategy, "code_diff": code_diff,
+                "construction": {"n": 0, "circles": [], "sum_radii": 0.0,
+                                 "min_radius": 0.0, "packing_density": 0.0},
+                "scores": _zero_scores(), "feedback": res["error"]}
+    scores = res["scores"]
+    invalid = scores.get("valid", 0.0) < 1.0
+    return {"error": invalid, "program": program, "summary": summary,
+            "strategy": strategy, "code_diff": code_diff,
+            "construction": res["construction"], "scores": scores,
+            "feedback": None if not invalid else "invalid: circles overlap or leave the square"}
+
+
+def _executable_base(program: str, exp: Experiment, seed: int) -> Tuple[str, Dict]:
+    """Return an executable base program + its eval result. Falls back to the
+    canonical INITIAL_PROGRAM if the given program does not run (e.g. a seeded
+    version whose stored program is illustrative pseudo-code)."""
+    res = executor.run_and_eval(program or "", exp.n_circles, seed)
+    if res["ok"] and res["scores"].get("valid", 0.0) >= 1.0:
+        return program, res
+    res = executor.run_and_eval(packing.INITIAL_PROGRAM, exp.n_circles, seed)
+    return packing.INITIAL_PROGRAM, res
+
+
+def _sample_prog_parent(pop: List[Tuple], rnd: random.Random):
+    """pop items: (candidate, program, score). Weighted by score w/ exploration."""
+    if rnd.random() < 0.25:
+        return rnd.choice(pop)
+    weights = [max(0.01, p[2]) for p in pop]
+    total = sum(weights)
+    pick = rnd.uniform(0, total)
+    acc = 0.0
+    for p, w in zip(pop, weights):
+        acc += w
+        if acc >= pick:
+            return p
+    return pop[-1]
+
+
+def _build_candidate_tree_live(version: ExperimentVersion, exp: Experiment,
+                               seed: int, count: int
+                               ) -> Tuple[List[Candidate], Candidate]:
+    rnd = random.Random(seed)
+    base_prog, base_res = _executable_base(version.program, exp, seed)
+    base_scores = base_res["scores"] if base_res["ok"] else _zero_scores()
+    base_constr = base_res["construction"] if base_res["ok"] else {
+        "n": 0, "circles": [], "sum_radii": 0.0, "min_radius": 0.0, "packing_density": 0.0}
+    root = STORE.add_candidate(
+        version_id=version.id, parent_candidate_id=None,
+        code_diff="(baseline construction)", scores_per_metric=base_scores,
+        construction=base_constr, visualization={"kind": "circles"},
+        ai_summary=f"Baseline construction — sum of radii {base_scores['sum_radii']:.3f}.",
+        generation=0, strategy="baseline", is_error=base_scores.get("valid", 0) < 1.0,
+    )
+    created = [root]
+    pop = [(root, base_prog, base_scores.get("sum_radii", 0.0))]
+    best_cand, best_prog = root, base_prog
+    best_val = base_scores.get("sum_radii", 0.0)
+    feedback = None
+
+    for g in range(1, count):
+        parent = _sample_prog_parent(pop, rnd)
+        step = _llm_step(exp, parent[1], {"sum_radii": parent[2]}, feedback, seed + g)
+        feedback = step["feedback"]
+        cand = STORE.add_candidate(
+            version_id=version.id, parent_candidate_id=parent[0].id,
+            code_diff=step["code_diff"], scores_per_metric=step["scores"],
+            construction=step["construction"], visualization={"kind": "circles"},
+            ai_summary=step["summary"], generation=g, strategy=step["strategy"],
+            is_error=step["error"],
+        )
+        created.append(cand)
+        if not step["error"]:
+            val = step["scores"].get("sum_radii", 0.0)
+            pop.append((cand, step["program"], val))
+            if val > best_val:
+                best_val, best_cand, best_prog = val, cand, step["program"]
+
+    for c in created:
+        c.is_current_best = False
+    best_cand.is_current_best = True
+    version.best_scores = dict(best_cand.scores_per_metric)
+    return created, best_cand
+
+
+# ---------------------------------------------------------------------------
 # Candidate tree construction for a version.
 # ---------------------------------------------------------------------------
 def build_candidate_tree(version: ExperimentVersion, n: int, strategy: str,
-                         seed: int, count: int, error_rate: float = 0.10
+                         seed: int, count: int, error_rate: float = 0.10,
+                         deterministic: bool = False
                          ) -> Tuple[List[Candidate], Candidate]:
+    if _use_live(deterministic):
+        return _build_candidate_tree_live(version, STORE.experiments[version.experiment_id],
+                                          seed, min(count, config.LIVE_CANDIDATE_COUNT))
     rnd = random.Random(seed)
     centers = packing.initial_centers(n, strategy, seed)
     r = packing.inflate(centers)
@@ -234,7 +393,156 @@ def run_short(exp: Experiment, strategy: str, seed: int):
     return run
 
 
-def launch_short_runs(exp: Experiment, n_runs: int = 4) -> List:
+# (short label, strategy hint) — the label keeps the card headers tidy.
+_SHORT_RUN_HINTS = [
+    ("hexagonal", "a hexagonal / honeycomb arrangement"),
+    ("sunflower", "a sunflower / golden-angle spiral layout"),
+    ("physics-relax", "a physics-style repulsion + inflation relaxation"),
+    ("concentric", "concentric rings around the centre"),
+    ("greedy", "a randomized greedy placement with local optimization"),
+]
+# Deterministic strategies used to guarantee a populated card if every live
+# attempt for a run is invalid.
+_FALLBACK_STRATEGIES = ["hex", "spiral", "grid", "concentric", "random"]
+
+
+def _llm_one_program(exp: Experiment, hint: str, feedback: Optional[str] = None
+                     ) -> Tuple[str, str, str]:
+    """Ask Gemini for ONE construct_packing program using a strategy hint.
+
+    Single-program requests are reliable (they fit the token budget), unlike
+    asking for several programs in one JSON response. ``feedback`` carries the
+    previous attempt's error so the model can fix it (artifact/error channel).
+    """
+    system = (
+        "You are AlphaEvolve. Write a single Python function construct_packing(n, "
+        "seed) that returns a list of EXACTLY n dicts {'x','y','r'} — n circles in "
+        "the unit square [0,1]^2, each fully inside (r <= x <= 1-r and r <= y <= "
+        "1-r) and no two overlapping, maximizing the sum of radii. Use ONLY the "
+        "standard library (math, random). Return STRICT JSON {\"program\": <full "
+        "source>, \"strategy\": <short label>, \"summary\": <one sentence>} OR just "
+        "a ```python code block. No prose."
+    )
+    user = (f"Problem: {exp.description}\nn = {exp.n_circles} circles.\n"
+            f"Approach to try: {hint}.\nReturn the program.")
+    if feedback:
+        user += (f"\n\nYour previous attempt was rejected: {feedback}\n"
+                 f"Return a corrected program that yields exactly {exp.n_circles} "
+                 "valid, non-overlapping circles inside the square.")
+    raw = gc.chat([{"role": "system", "content": system},
+                   {"role": "user", "content": user}],
+                  temperature=0.9, max_tokens=2600)
+    parsed = gc.extract_json(raw) or {}
+    program = (parsed.get("program") or "").strip()
+    if "def construct_packing" not in program:
+        # Don't silently fall back to the baseline here — return "" so the caller
+        # marks it invalid and retries (keeps short-run cards honestly live).
+        program = gc.extract_code_block(raw) or ""
+    strategy = (parsed.get("strategy") or hint.split("/")[0].strip()).strip()[:22]
+    summary = (parsed.get("summary") or f"{hint} packing.").strip()[:200]
+    return program, strategy, summary
+
+
+def _eval_over_seeds(exp: Experiment, prog: str) -> Dict:
+    """Run a program over several seeds; keep the best VALID full-n packing.
+
+    Returns best {scores, construction, history, ok_full (valid & n circles), err}.
+    """
+    n = exp.n_circles
+    best_val = -1.0
+    best = {"scores": _zero_scores(),
+            "construction": {"n": 0, "circles": [], "sum_radii": 0.0,
+                             "min_radius": 0.0, "packing_density": 0.0},
+            "ok_full": False}
+    history, err = [], None
+    for s in range(config.LIVE_SHORT_RUN_SEEDS):
+        res = executor.run_and_eval(prog, n, s)
+        if not res["ok"]:
+            err = err or res["error"]
+            val, ok_full = 0.0, False
+            scores, constr = _zero_scores(), best["construction"]
+        else:
+            scores, constr = res["scores"], res["construction"]
+            val = scores["sum_radii"]
+            if scores.get("valid", 0.0) < 1.0:
+                err = err or "invalid packing (circles overlap or leave the square)"
+                ok_full = False
+            elif constr["n"] != n:
+                err = err or f"returned {constr['n']} circles but need exactly {n}"
+                ok_full = False
+            else:
+                ok_full = True
+        if val > best_val:
+            best_val = val
+            best = {"scores": scores, "construction": constr, "ok_full": ok_full}
+        history.append(round(max(0.0, best_val), 5))
+    best["history"] = history
+    best["val"] = max(0.0, best_val)
+    best["err"] = err
+    return best
+
+
+def _short_runs_live(exp: Experiment, n_runs: int) -> List:
+    # Deterministic reference score (no API) so we can reject valid-but-trivial
+    # packings (e.g. 26 microscopic circles) and only accept a decent result.
+    _c, _r, _h = packing.evolve_packing(exp.n_circles, "hex", 1,
+                                        config.CHEAP_TEST_GENERATIONS)
+    ref = packing.score(_r)["sum_radii"]
+    threshold = 0.5 * ref
+
+    runs = []
+    for i in range(n_runs):
+        label, hint = _SHORT_RUN_HINTS[i % len(_SHORT_RUN_HINTS)]
+        feedback = None
+        chosen = None          # first result that is valid AND above threshold
+        strat, summary = label, f"{hint} packing."
+        # Retry with error feedback until we get a good, valid, full-n packing.
+        for _attempt in range(config.LIVE_SHORT_RUN_ATTEMPTS):
+            prog, strat, summary = _llm_one_program(exp, hint, feedback=feedback)
+            ev = _eval_over_seeds(exp, prog)
+            if ev["ok_full"] and ev["val"] >= threshold:
+                chosen = ev
+                break
+            if not ev["ok_full"]:
+                feedback = ev["err"] or "produced an invalid or empty packing"
+            else:
+                feedback = (f"the packing is valid but the sum of radii is only "
+                            f"{ev['val']:.3f} — the circles are far too small. Grow "
+                            f"every circle until it touches a neighbour or a wall; "
+                            f"aim for a total near {ref:.2f}.")
+
+        if chosen is not None:
+            ev, note = chosen, ("live: executed real Gemini-written code over "
+                                f"{config.LIVE_SHORT_RUN_SEEDS} seeds")
+        else:
+            # Last resort: a validated deterministic packing so the card is populated.
+            fstrat = _FALLBACK_STRATEGIES[i % len(_FALLBACK_STRATEGIES)]
+            centers, radii, hist = packing.evolve_packing(
+                exp.n_circles, fstrat, 100 + i * 7, config.SHORT_RUN_GENERATIONS)
+            sc = packing.score(radii); sc["valid"] = 1.0
+            ev = {"scores": sc, "construction": packing.construction_from(centers, radii),
+                  "history": hist, "val": sc["sum_radii"]}
+            strat = f"{label} (fallback)"
+            summary = (f"Gemini's programs for '{hint}' were invalid or too small "
+                       f"after {config.LIVE_SHORT_RUN_ATTEMPTS} attempts; showing a "
+                       f"validated {fstrat} packing instead.")
+            note = "fallback: deterministic packing (live attempts were weak)"
+
+        sc = ev["scores"]
+        runs.append(STORE.add_run(
+            experiment_id=exp.id, version_id=exp.root_version_id, kind="short_test",
+            status="completed", strategy=strat, seed=i,
+            best_score=sc["sum_radii"], best_scores=sc,
+            per_generation_score_history=ev["history"] or [0.0],
+            construction=ev["construction"],
+            ai_summary=f"{summary} Best sum-of-radii {sc['sum_radii']:.3f} ({note})."))
+    return runs
+
+
+def launch_short_runs(exp: Experiment, n_runs: int = 4,
+                      deterministic: bool = False) -> List:
+    if _use_live(deterministic):
+        return _short_runs_live(exp, n_runs)
     strategies = packing.STRATEGIES[:]
     runs = []
     for i in range(n_runs):
@@ -257,7 +565,41 @@ CRITIQUE_MOCK = (
 )
 
 
+def _cheap_test_live(exp: Experiment) -> Dict:
+    prog = exp.initial_program or packing.INITIAL_PROGRAM
+    res = executor.run_and_eval(prog, exp.n_circles, 7)
+    exec_error = None
+    if res["ok"]:
+        scores, construction = res["scores"], res["construction"]
+        best, history = 0.0, []
+        for s in range(config.CHEAP_TEST_GENERATIONS):
+            r2 = executor.run_and_eval(prog, exp.n_circles, s)
+            best = max(best, r2["scores"]["sum_radii"] if r2["ok"] else 0.0)
+            history.append(round(best, 5))
+    else:
+        exec_error = res["error"]
+        scores = _zero_scores()
+        construction = {"n": 0, "circles": [], "sum_radii": 0.0,
+                        "min_radius": 0.0, "packing_density": 0.0}
+        history = [0.0]
+    critique = gc.complete(
+        system="You are a careful ML experiment reviewer. In <=120 words flag "
+               "likely reward-hacks and specification problems in this setup.",
+        user=f"Problem: {exp.description}\n\nProgram:\n{prog}\n\nEval code:\n"
+             f"{exp.eval_code}\n\nExecuted metrics: {scores}"
+             + (f"\nExecution error: {exec_error}" if exec_error else ""),
+        mock=CRITIQUE_MOCK,
+    )
+    out = {"metrics": scores, "history": history,
+           "construction": construction, "critique": critique}
+    if exec_error:
+        out["execution_error"] = exec_error
+    return out
+
+
 def cheap_test(exp: Experiment, strategy: str = "grid", seed: int = 7) -> Dict:
+    if _use_live():
+        return _cheap_test_live(exp)
     centers, radii, history = packing.evolve_packing(
         exp.n_circles, strategy, seed, config.CHEAP_TEST_GENERATIONS)
     scores = packing.score(radii)
@@ -298,11 +640,19 @@ def configure(prompt: str, initial_program: str = "", eval_code: str = "") -> Di
         })
 
     raw = gc.complete(
-        system="You are AlphaEvolve's setup assistant. Given a problem "
-               "statement, return STRICT JSON with keys: title, description, "
-               "metrics (list of metric names), n_circles (int). No prose.",
+        system="You are AlphaEvolve's setup assistant. Given a problem statement, "
+               "scaffold an experiment and return STRICT JSON with keys: title, "
+               "description, metrics (list of metric names), n_circles (int), "
+               "initial_program (a full Python program defining "
+               "construct_packing(n, seed) that returns a list of dicts "
+               "{'x','y','r'} — circles in the unit square, non-overlapping), "
+               "eval_code (a full Python program defining evaluate(circles) that "
+               "returns a dict of metrics), visualization_code (a short Python "
+               "comment/function describing how to render the construction). Use "
+               "only the standard library. No prose outside the JSON.",
         user=prompt or packing.PROBLEM_CONTEXT,
         mock=mock_config,
+        max_tokens=3200,
     )
     parsed = gc.extract_json(raw) or {}
     title = parsed.get("title") or "Untitled Experiment"
@@ -310,15 +660,27 @@ def configure(prompt: str, initial_program: str = "", eval_code: str = "") -> Di
     metrics = parsed.get("metrics") or ["sum_radii", "min_radius", "packing_density"]
     n_circles = int(parsed.get("n_circles") or config.DEFAULT_N_CIRCLES)
 
-    # If the user did not supply code, scaffold the canonical demo programs.
-    prog = initial_program.strip() or packing.INITIAL_PROGRAM
-    ev = eval_code.strip() or packing.EVAL_CODE
+    # User-supplied code wins; else use Gemini's (live) or the canonical demo (mock).
+    blocks = gc.extract_all_code_blocks(raw)
+
+    def _pick(marker: str) -> str:
+        for b in blocks:
+            if marker in b:
+                return b
+        return ""
+
+    prog = initial_program.strip() or (parsed.get("initial_program") or "").strip() \
+        or _pick("def construct_packing") or packing.INITIAL_PROGRAM
+    ev = eval_code.strip() or (parsed.get("eval_code") or "").strip() \
+        or _pick("def evaluate") or packing.EVAL_CODE
+    viz = (parsed.get("visualization_code") or "").strip() \
+        or _pick("def visualize") or packing.VISUALIZATION_CODE
     return {
         "title": title,
         "description": description,
         "initial_program": prog,
         "eval_code": ev,
-        "visualization_code": packing.VISUALIZATION_CODE,
+        "visualization_code": viz,
         "metrics": metrics,
         "n_circles": n_circles,
     }
@@ -361,7 +723,75 @@ def start_full_run(exp: Experiment, version: ExperimentVersion, strategy: str,
     return run
 
 
+def _full_run_worker_live(exp, version, run, seed, gens):
+    """Streamed AlphaEvolve loop: each generation Gemini rewrites the program, we
+    execute + evaluate it, store the candidate, and push an SSE update."""
+    n = exp.n_circles
+    base_prog, base_res = _executable_base(version.program, exp, seed)
+    base_scores = base_res["scores"] if base_res["ok"] else _zero_scores()
+    base_constr = base_res["construction"] if base_res["ok"] else {
+        "n": 0, "circles": [], "sum_radii": 0.0, "min_radius": 0.0, "packing_density": 0.0}
+
+    existing = STORE.version_candidates(version.id)
+    valid_existing = [c for c in existing if not c.is_error]
+    if valid_existing:
+        best_cand = max(valid_existing, key=lambda c: c.scores_per_metric.get("sum_radii", 0))
+    else:
+        best_cand = STORE.add_candidate(
+            version_id=version.id, parent_candidate_id=None,
+            code_diff="(baseline construction)", scores_per_metric=base_scores,
+            construction=base_constr, visualization={"kind": "circles"},
+            ai_summary=f"Baseline — sum of radii {base_scores['sum_radii']:.3f}.",
+            generation=0, strategy="baseline", is_current_best=True)
+    best_prog = base_prog
+    best_val = best_cand.scores_per_metric.get("sum_radii", 0.0)
+    exp.best_scores = dict(best_cand.scores_per_metric)
+    exp.best_candidate_id = best_cand.id
+    feedback = None
+
+    for g in range(1, gens + 1):
+        if run.status == "stopped":
+            break
+        step = _llm_step(exp, best_prog, {"sum_radii": best_val}, feedback, seed + g)
+        feedback = step["feedback"]
+        exp.generated += 1
+        exp.executed += 1
+        exp.last_generation_at = time.time()
+        if step["error"]:
+            exp.failed += 1
+        cand = STORE.add_candidate(
+            version_id=version.id, parent_candidate_id=best_cand.id,
+            code_diff=step["code_diff"], scores_per_metric=step["scores"],
+            construction=step["construction"], visualization={"kind": "circles"},
+            ai_summary=step["summary"], generation=g, strategy=step["strategy"],
+            is_error=step["error"])
+        val = step["scores"].get("sum_radii", 0.0)
+        if not step["error"] and val > best_val + 1e-9:
+            best_val, best_prog = val, step["program"]
+            best_cand.is_current_best = False
+            cand.is_current_best = True
+            best_cand = cand
+            exp.best_scores = step["scores"]
+            exp.best_candidate_id = cand.id
+            exp.last_improvement_at = time.time()
+            version.best_scores = step["scores"]
+        run.per_generation_score_history.append(round(best_val, 5))
+        run.best_score = round(best_val, 5)
+        run.best_scores = dict(exp.best_scores)
+        run.best_candidate_id = exp.best_candidate_id
+        _publish_experiment_snapshot(
+            exp, {"generation": g, "total_generations": gens,
+                  "best": round(best_val, 5), "new_candidate": _candidate_public(cand)})
+
+    run.status = "completed" if run.status != "stopped" else "stopped"
+    exp.status = "stopped"
+    STORE.publish(exp.id, {"type": "done", "experiment_id": exp.id, "status": exp.status})
+
+
 def _full_run_worker(exp, version, run, strategy, seed, gens):
+    if _use_live():
+        return _full_run_worker_live(exp, version, run, seed,
+                                     min(gens, config.LIVE_FULL_RUN_GENERATIONS))
     rnd = random.Random(seed)
     n = exp.n_circles
     # Seed from the version's current best candidate if present, else fresh.
@@ -504,6 +934,11 @@ def steer(exp: Experiment, action: str, candidate_id: Optional[str],
     else:
         raise ValueError(f"unknown steer action: {action}")
 
+    # Live mode: let Gemini write the actual proposed change + program.
+    if _use_live() and action != "prune":
+        changes, prog = _steer_live(exp, action, cand,
+                                    STORE.candidates.get(second_candidate_id), note)
+
     parent_ver = STORE.versions.get(version_id) or (
         STORE.versions.get(cand.version_id) if cand else None)
     parent_prog = parent_ver.program if parent_ver else packing.INITIAL_PROGRAM
@@ -530,6 +965,220 @@ def steer(exp: Experiment, action: str, candidate_id: Optional[str],
 _PROPOSAL_PROGRAMS: Dict[str, str] = {}
 
 
+_STEER_ACTION_GUIDE = {
+    "fork": "Fork a new version from the selected candidate and keep improving it.",
+    "explore": "Explore the neighborhood of the selected candidate's branch more aggressively.",
+    "cross_mutate": "Combine ideas from the two selected candidates/branches into one program.",
+    "merge": "Consolidate the selected version(s), keeping the strongest ideas.",
+}
+
+
+def _cand_desc(c) -> str:
+    if not c:
+        return "none"
+    return (f"#{_short(c.id)} ({c.strategy}, gen {c.generation}, "
+            f"sum_radii {c.scores_per_metric.get('sum_radii', 0):.3f})")
+
+
+def _generate_valid_program(system: str, base_user: str, exp: Experiment
+                            ) -> Tuple[str, dict]:
+    """Ask Gemini for a program, retrying (with error feedback) until it is a
+    valid full-n packing. Returns (program, first_parsed_json).
+
+    Shared by steering and chat-driven steering so proposals are always backed by
+    an executable program (and the draft's cheap test is meaningful).
+    """
+    best_prog = ""
+    first_parsed: dict = {}
+    feedback = ""
+    for _attempt in range(config.LIVE_STEER_ATTEMPTS):
+        raw = gc.chat([{"role": "system", "content": system},
+                       {"role": "user", "content": base_user + feedback}],
+                      temperature=0.8, max_tokens=2600)
+        parsed = gc.extract_json(raw) or {}
+        if not first_parsed and parsed:
+            first_parsed = parsed
+        prog = (parsed.get("program") or "").strip()
+        if "def construct_packing" not in prog:
+            prog = gc.extract_code_block(raw) or ""
+        if "def construct_packing" in prog:
+            best_prog = best_prog or prog
+            res = executor.run_and_eval(prog, exp.n_circles, 0)
+            if res["ok"] and res["scores"].get("valid", 0.0) >= 1.0 \
+                    and res["construction"]["n"] == exp.n_circles:
+                return prog, (first_parsed or parsed)
+            err = res.get("error") or "the packing was invalid or had the wrong number of circles"
+            feedback = (f"\n\nYour previous program was rejected: {err}. Return a "
+                        f"corrected full program with exactly {exp.n_circles} valid, "
+                        "non-overlapping circles inside the unit square.")
+    return (best_prog or packing.INITIAL_PROGRAM), first_parsed
+
+
+def _steer_live(exp: Experiment, action: str, cand, cand2, note: str) -> Tuple[str, str]:
+    """Live: Gemini proposes the concrete change + an executable program."""
+    ver = STORE.versions.get(cand.version_id) if cand else None
+    base_prog = (ver.program if ver else "") or packing.INITIAL_PROGRAM
+    system = (
+        "You are AlphaEvolve's steering assistant. The user chose the action "
+        f"'{action}': {_STEER_ACTION_GUIDE.get(action, action)} Propose the concrete "
+        "change and a NEW full Python program defining construct_packing(n, seed) "
+        "that returns non-overlapping circles {'x','y','r'} in the unit square, "
+        "maximizing sum of radii. Stdlib only. Return STRICT JSON: "
+        "{\"proposed_changes\": <2-4 sentence explanation>, \"program\": <full python source>}."
+    )
+    base_user = (
+        f"Problem: {exp.description}\nn = {exp.n_circles}.\n"
+        f"Selected branch A: {_cand_desc(cand)}\n"
+        f"Selected branch B: {_cand_desc(cand2)}\n"
+        + (f"User note: {note}\n" if note else "")
+        + f"\nCurrent program:\n```python\n{base_prog}\n```\n\nReturn JSON."
+    )
+    prog, parsed = _generate_valid_program(system, base_user, exp)
+    changes = (parsed.get("proposed_changes") or "").strip() or \
+        f"{action} from candidate {_cand_desc(cand)}."
+    if note:
+        changes += f"\n\nNote: {note}"
+    return changes, prog
+
+
+# ---------------------------------------------------------------------------
+# Chat-driven steering (Ask/Diagnose "Execute" button) — turns the diagnosis
+# conversation into a Draft Proposal (never an immediate change).
+# ---------------------------------------------------------------------------
+def _chat_transcript(messages: List[dict]) -> str:
+    lines = []
+    for m in (messages or []):
+        role = (m.get("role") or "user").upper()
+        text = (m.get("text") or "").strip()
+        if text:
+            lines.append(f"{role}: {text}")
+    return "\n".join(lines[-12:])  # keep the last dozen turns
+
+
+def _steer_from_chat_live(exp: Experiment, messages, cand, ver) -> Tuple[str, str]:
+    base_prog = (ver.program if ver else "") or packing.INITIAL_PROGRAM
+    system = (
+        "You are AlphaEvolve's steering assistant. Based on the user's diagnostic "
+        "conversation, propose a concrete change and a NEW full Python program "
+        "defining construct_packing(n, seed) that returns non-overlapping circles "
+        "{'x','y','r'} in the unit square, maximizing sum of radii. Stdlib only. "
+        "Return STRICT JSON: {\"proposed_changes\": <2-4 sentence explanation of "
+        "what you changed and why, referencing the discussion>, \"program\": <full "
+        "python source>}."
+    )
+    base_user = (
+        f"Problem: {exp.description}\nn = {exp.n_circles}.\n"
+        f"Selected candidate: {_cand_desc(cand)}\n\n"
+        f"Diagnosis conversation:\n{_chat_transcript(messages)}\n\n"
+        f"Current program:\n```python\n{base_prog}\n```\n\n"
+        "Draft the change the conversation points to. Return JSON."
+    )
+    prog, parsed = _generate_valid_program(system, base_user, exp)
+    changes = (parsed.get("proposed_changes") or "").strip() or \
+        "Draft applying the direction from the diagnosis chat."
+    return changes, prog
+
+
+def _steer_from_chat_mock(exp: Experiment, messages, cand, ver) -> Tuple[str, str]:
+    last_user = ""
+    for m in reversed(messages or []):
+        if (m.get("role") or "user") == "user" and (m.get("text") or "").strip():
+            last_user = m["text"].strip()
+            break
+    strat = cand.strategy if cand else "grid"
+    changes = ("Draft a new version applying the direction from the diagnosis chat"
+               + (f": “{last_user[:140]}”" if last_user else ".")
+               + (f" Fork from candidate #{_short(cand.id)} and continue evolving."
+                  if cand else ""))
+    prog = program_variant(strat, relax_passes=8, note="from diagnosis chat")
+    return changes, prog
+
+
+def steer_from_chat(exp: Experiment, messages, candidate_id: Optional[str],
+                    version_id: Optional[str], note: str = "") -> Dict:
+    cand = STORE.candidates.get(candidate_id) if candidate_id else None
+    ver = STORE.versions.get(version_id) or \
+        (STORE.versions.get(cand.version_id) if cand else None) or \
+        STORE.versions.get(exp.root_version_id)
+    versions = STORE.experiment_versions(exp.id)
+    next_label = f"v{len(versions) + 1}"
+
+    if _use_live():
+        changes, prog = _steer_from_chat_live(exp, messages, cand, ver)
+    else:
+        changes, prog = _steer_from_chat_mock(exp, messages, cand, ver)
+    if note:
+        changes += f"\n\nNote: {note}"
+
+    parent_prog = ver.program if ver else packing.INITIAL_PROGRAM
+    diff_preview = unified_summary(parent_prog, prog)
+    prop = STORE.add_proposal(
+        experiment_id=exp.id,
+        base_candidate_id=candidate_id,
+        origin="manual_edit",
+        label=f"{next_label} draft (from chat)"
+              + (f" based on candidate #{_short(candidate_id)}" if candidate_id else ""),
+        proposed_changes=changes,
+        files_affected=["initial_program.py"],
+        diff_preview=diff_preview,
+        target_version_id=(ver.id if ver else exp.root_version_id),
+    )
+    _PROPOSAL_PROGRAMS[prop.id] = prog
+    return {"proposal": _proposal_public(prop), "proposed_program": prog}
+
+
+def _test_proposal_live(prop) -> Dict:
+    exp = STORE.experiments[prop.experiment_id]
+    prog = _PROPOSAL_PROGRAMS.get(prop.id) or packing.INITIAL_PROGRAM
+    base = STORE.candidates.get(prop.base_candidate_id)
+    base_score = base.scores_per_metric.get("sum_radii", 0.0) if base else 0.0
+    best_val = -1.0
+    best_scores = _zero_scores()
+    best_constr = None
+    preview_constr = None       # any produced construction (even if invalid)
+    history = []
+    err = None
+    for s in range(config.LIVE_SHORT_RUN_SEEDS):
+        res = executor.run_and_eval(prog, exp.n_circles, s)
+        if res["ok"]:
+            constr = res["construction"]
+            if constr["circles"] and (preview_constr is None
+                                      or constr["n"] > preview_constr["n"]):
+                preview_constr = constr
+            val = res["scores"]["sum_radii"]
+            if val > best_val:
+                best_val, best_scores, best_constr = val, res["scores"], constr
+        else:
+            err = res["error"]
+        history.append(round(max(0.0, best_val), 5))
+
+    # Always show a preview: prefer the best valid packing, else any produced
+    # construction (invalid), else the base candidate's construction for context.
+    constr = best_constr if (best_constr and best_constr["circles"]) else preview_constr
+    if not constr and base:
+        constr = base.construction
+    if not constr:
+        constr = {"n": 0, "circles": [], "sum_radii": 0.0,
+                  "min_radius": 0.0, "packing_density": 0.0}
+
+    delta = round(best_scores["sum_radii"] - base_score, 4)
+    if best_val > 0:
+        note = (f"Live cheap test: executed the proposed program over "
+                f"{config.LIVE_SHORT_RUN_SEEDS} seeds → sum_radii "
+                f"{best_scores['sum_radii']:.3f} "
+                f"({'+' if delta >= 0 else ''}{delta} vs base).")
+    else:
+        note = ("Live cheap test: the proposed program did not produce a valid "
+                "packing" + (f" ({err})" if err else "")
+                + ". Preview shows the attempted construction.")
+    result = {"kind": "evolve", "metrics": best_scores, "history": history or [0.0],
+              "construction": constr, "invalid": best_val <= 0,
+              "delta_sum_radii": delta, "note": note}
+    prop.cheap_test_result = result
+    prop.status = "tested"
+    return result
+
+
 def test_proposal(prop) -> Dict:
     exp = STORE.experiments[prop.experiment_id]
     if prop.origin == "prune":
@@ -541,6 +1190,8 @@ def test_proposal(prop) -> Dict:
         prop.cheap_test_result = result
         prop.status = "tested"
         return result
+    if _use_live():
+        return _test_proposal_live(prop)
     # Cheap-test the proposed variant.
     base = STORE.candidates.get(prop.base_candidate_id)
     strat = base.strategy if base else "grid"
@@ -594,17 +1245,16 @@ def accept_proposal(prop) -> Dict:
         program=prog,
         note=prop.proposed_changes,
     )
-    # Build a candidate tree for the new version (seeded from the branch).
-    _cands, best = build_candidate_tree(
-        version, exp.n_circles, strat, seed, count=12)
 
-    # Score deltas vs parent (per metric).
+    # Seed the version with a baseline candidate (its starting point) — the live
+    # run then evolves its trials from here and streams them to the dashboard.
+    baseline = _seed_version_baseline(exp, version, prog, strat, seed)
+
+    # Score deltas vs parent (from the starting point; the run refines the best).
     parent_best = parent_ver.best_scores if parent_ver else {}
-    deltas = {}
-    for m in METRICS:
-        deltas[m] = round(best.scores_per_metric.get(m, 0.0)
-                          - parent_best.get(m, 0.0), 4)
-    version.score_deltas_per_metric = deltas
+    version.score_deltas_per_metric = {
+        m: round(baseline.scores_per_metric.get(m, 0.0) - parent_best.get(m, 0.0), 4)
+        for m in METRICS}
 
     # Provenance: mark the source candidate as forked into this version.
     if base:
@@ -612,8 +1262,40 @@ def accept_proposal(prop) -> Dict:
 
     prop.status = "accepted"
     prop.target_version_id = version.id
+
+    # Kick off a live full run on the new version — this streams its trials to
+    # the dashboard (Screen 3), which the frontend navigates to on accept.
+    run = start_full_run(exp, version, strat, seed)
+
     return {"version": _version_public(version),
-            "best_candidate": _candidate_public(best)}
+            "best_candidate": _candidate_public(baseline),
+            "run_id": run.id, "experiment_id": exp.id}
+
+
+def _seed_version_baseline(exp: Experiment, version: ExperimentVersion,
+                           prog: str, strat: str, seed: int) -> Candidate:
+    """Create the new version's baseline candidate (its evolution starting point)."""
+    if _use_live():
+        _base_prog, base_res = _executable_base(prog, exp, seed)
+        scores = base_res["scores"] if base_res["ok"] else _zero_scores()
+        constr = base_res["construction"] if base_res["ok"] else {
+            "n": 0, "circles": [], "sum_radii": 0.0, "min_radius": 0.0,
+            "packing_density": 0.0}
+        label = "baseline"
+    else:
+        centers = packing.initial_centers(exp.n_circles, strat, seed)
+        r = packing.inflate(centers)
+        scores = packing.score(r); scores["valid"] = 1.0
+        constr = packing.construction_from(centers, r)
+        label = strat
+    cand = STORE.add_candidate(
+        version_id=version.id, parent_candidate_id=None,
+        code_diff="(baseline construction)", scores_per_metric=scores,
+        construction=constr, visualization={"kind": "circles"},
+        ai_summary=f"Baseline for {version.label} — sum of radii {scores['sum_radii']:.3f}.",
+        generation=0, strategy=label, is_current_best=True)
+    version.best_scores = dict(scores)
+    return cand
 
 
 # ---------------------------------------------------------------------------

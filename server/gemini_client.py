@@ -36,19 +36,23 @@ def chat(messages: List[Dict[str, str]], mock: MockLike = None,
     if not config.LIVE_ENABLED or requests is None:
         return _resolve_mock(mock)
     try:
+        payload = {
+            "model": config.GEMINI_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        # Disable Gemini 2.5 "thinking" so long code/JSON outputs aren't truncated.
+        if config.GEMINI_REASONING_EFFORT:
+            payload["reasoning_effort"] = config.GEMINI_REASONING_EFFORT
         resp = requests.post(
             f"{config.GEMINI_BASE_URL}/chat/completions",
             headers={
                 "Authorization": f"Bearer {config.GEMINI_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": config.GEMINI_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=45,
+            json=payload,
+            timeout=90,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -65,6 +69,26 @@ def complete(system: str, user: str, mock: MockLike = None,
          {"role": "user", "content": user}],
         mock=mock, temperature=temperature, max_tokens=max_tokens,
     )
+
+
+def extract_code_block(text: str, lang: str = "python") -> str:
+    """Return the first fenced code block (```lang ... ```), else "" .
+
+    Robust fallback for pulling program source out of an LLM response when the
+    model returns code instead of (or alongside) JSON.
+    """
+    if not text:
+        return ""
+    m = re.search(r"```(?:" + re.escape(lang) + r"|py)?\s*\n(.*?)```", text,
+                  re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def extract_all_code_blocks(text: str) -> list:
+    if not text:
+        return []
+    return [b.strip() for b in
+            re.findall(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)]
 
 
 def extract_json(text: str) -> Optional[dict]:

@@ -1,0 +1,24 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Node / Netlify (if you split the frontend)
+node_modules/
+.netlify/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Local Claude/preview scratch
+.claude/launch.json

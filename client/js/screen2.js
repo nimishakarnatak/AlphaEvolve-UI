@@ -12,15 +12,16 @@ const Screen2 = {
     }
     State.currentExperimentId = expId;
 
+    const live = State.status && State.status.live_enabled;
+    const blurb = live
+      ? "Each card is a real Gemini-written program, executed and scored over several seeds. Inspect the best score, its trend, the construction, and the AI summary, then promote one to a full experiment."
+      : "Each card is a brief evolution (40 generations) seeded with a different strategy hint. Inspect the best score, its score-vs-time trend, the construction, and the AI summary, then promote one to a full experiment.";
     c.appendChild(h(`
       <div class="row wrap" style="justify-content:space-between;align-items:flex-end">
         <div>
           <div class="section-title">Step 2 · Short runs</div>
           <h1 style="margin:2px 0;font-size:24px">Pick a strategy to promote</h1>
-          <p class="muted" style="margin:4px 0;max-width:640px">Each card is a brief
-          evolution (${"40"} generations) seeded with a different strategy hint. Inspect the
-          best score, its score-vs-time trend, the construction, and the AI summary,
-          then promote one to a full experiment.</p>
+          <p class="muted" style="margin:4px 0;max-width:640px">${blurb}</p>
         </div>
       </div>`));
 
