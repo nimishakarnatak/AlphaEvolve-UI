@@ -6,7 +6,7 @@ loops:
 
 - **Intentmaking** — define/refine an experiment → run a cheap test → inspect →
   refine → commit.
-- **Sensemaking + steering/provenance** — inspect candidates → steer (fork /
+- **Sensemaking and Human in the Loop** — inspect candidates → steer (fork /
   explore / cross-mutate / prune / merge) → review a draft proposal → cheap-test
   → accept as a new, fully-provenanced version.
 
