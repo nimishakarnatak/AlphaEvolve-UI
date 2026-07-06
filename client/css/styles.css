@@ -297,7 +297,13 @@ textarea.code { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; 
 .diff-marker { width: 16px; text-align:center; color: var(--text-faint); }
 
 /* Tree SVG ---------------------------------------------------------------- */
-.tree-svg { width: 100%; display: block; }
+.tree-svg { display: block; }
+.tree-controls { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; align-items: center; z-index: 3; }
+.tree-zbtn { width: 26px; height: 26px; border-radius: 7px; border: 1px solid var(--border-2); background: rgba(22,27,38,.9); color: var(--text); cursor: pointer; font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center; padding: 0; }
+.tree-zbtn:hover { background: var(--bg-3); border-color: var(--accent); }
+.tree-zoomind { font-size: 11px; color: var(--text-faint); font-family: var(--mono); min-width: 40px; text-align: right; background: rgba(11,13,18,.55); padding: 3px 6px; border-radius: 6px; }
+.tree-hint { position: absolute; bottom: 6px; left: 8px; font-size: 10px; color: var(--text-faint); pointer-events: none; background: rgba(11,13,18,.5); padding: 2px 7px; border-radius: 6px; }
+.tree-nodelabel { pointer-events: none; }
 .tree-node { cursor: pointer; }
 .tree-node circle { transition: r .12s, stroke-width .12s; }
 .tree-edge { stroke: var(--border-2); fill: none; }

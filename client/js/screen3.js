@@ -282,12 +282,14 @@ const Screen3 = {
   },
   drawTree(body) {
     const wrap = el("div");
-    const scroller = el("div", { style: "overflow:auto;max-height:420px;border:1px solid var(--border);border-radius:10px;background:var(--bg-1);padding:6px" });
+    const scroller = el("div", { style: "border:1px solid var(--border);border-radius:10px;background:var(--bg-1)" });
     wrap.appendChild(scroller);
     wrap.appendChild(treeLegend());
     body.appendChild(wrap);
     renderCandidateTree(scroller, this.versionCandidates(), {
       selectedId: this.selected && this.selected.id,
+      stateKey: "s3-" + this.viewVersionId,
+      height: 440,
       onSelect: (c) => { this.selected = c; this.updateSidebar(); this.drawTree(body); },
     });
   },

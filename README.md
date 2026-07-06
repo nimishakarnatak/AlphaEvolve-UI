@@ -205,8 +205,10 @@ and pre-computed short runs.
   **Pareto-front toggle** (multi-objective / reward-hack cross-check).
 - **(C) Programs:** three sub-views — **AI Overview**, **Evolution Tree**
   (nodes colored low→high, best ★ highlighted, invalid nodes distinct,
-  fork-out edges), **Programs Table** (filter / sort / top-K, thumbnail + AI
-  summary columns).
+  fork-out edges, with **semantic zoom** — scroll to zoom / drag to pan; zooming
+  in reveals more per node: dots → id+score labels → detail cards with a
+  construction thumbnail, strategy, scores and generation), **Programs Table**
+  (filter / sort / top-K, thumbnail + AI summary columns).
 - **(D) Selected-program sidebar:** scores, **Construction (raw data)**,
   **Visualization (rendered from construction)**, AI summary, and code diff.
 - **Start live run** streams updates over SSE (mock mode simulates streaming

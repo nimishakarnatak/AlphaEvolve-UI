@@ -276,10 +276,12 @@ const Screen4 = {
       el("h3", { html: `Candidate tree · <span class="pill pill-accent">${v ? v.label : "?"}</span>` }),
       el("span", { class: "faint", style: "font-size:11px", text: "click a node = Branch A" }),
     ]));
-    const scroller = el("div", { style: "overflow:auto;max-height:calc(62vh - 90px);border:1px solid var(--border);border-radius:10px;background:var(--bg-1);padding:6px" });
+    const scroller = el("div", { style: "border:1px solid var(--border);border-radius:10px;background:var(--bg-1)" });
     col.appendChild(scroller);
     renderCandidateTree(scroller, this.versionCandidates(this.selectedVersionId), {
       selectedId: this.selCandA,
+      stateKey: "s4-" + this.selectedVersionId,
+      height: Math.max(320, Math.floor((window.innerHeight - 56) * 0.5)),
       onSelect: (c) => {
         this.selCandA = c.id;
         this.build(document.querySelector(".view > div"));
