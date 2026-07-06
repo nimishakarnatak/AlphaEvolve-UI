@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlphaEvolve — Evolutionary Coding Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <!-- Top bar --------------------------------------------------------------->
+  <header class="topbar">
+    <div class="brand" data-nav="#/setup">
+      <span class="brand-mark">✦</span>
+      <span class="brand-name">AlphaEvolve</span>
+      <span class="brand-sub">evolutionary coding agent</span>
+    </div>
+    <nav class="nav">
+      <a data-nav="#/setup" class="nav-link">1 · Setup</a>
+      <a data-nav="#/short-runs" class="nav-link">2 · Short Runs</a>
+      <a data-nav="#/experiment" class="nav-link">3 · Dashboard</a>
+      <a data-nav="#/versions" class="nav-link">4 · Versioning</a>
+    </nav>
+    <div class="topbar-right">
+      <span id="mode-badge" class="badge badge-mock" title="Mock vs live mode">mock</span>
+    </div>
+  </header>
+
+  <!-- View container: each screen module renders into #view ---------------->
+  <main id="view" class="view"></main>
+
+  <!-- Toast host ------------------------------------------------------------>
+  <div id="toast-host" class="toast-host"></div>
+
+  <!-- App scripts (plain JS, no framework) --------------------------------->
+  <script src="js/api.js"></script>
+  <script src="js/svg.js"></script>
+  <script src="js/charts.js"></script>
+  <script src="js/tree.js"></script>
+  <script src="js/diff.js"></script>
+  <script src="js/screen1.js"></script>
+  <script src="js/screen2.js"></script>
+  <script src="js/screen3.js"></script>
+  <script src="js/screen4.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
