@@ -23,6 +23,29 @@ evaluation, `scripts/visualizer.py`, Gemini via the OpenAI-compatible endpoint).
 
 ---
 
+## UI screenshots
+
+Frames captured directly from the `alphaevolve-ui-demo.mov` recording.
+Click any image to view it at full resolution.
+
+### Sensemaking dashboard
+
+Monitor run status, score improvements, and the selected program's circle-packing construction.
+
+[![Sensemaking dashboard with run statistics, score history, and a circle-packing visualization](docs/screenshots/dashboard.png)](docs/screenshots/dashboard.png)
+
+| Setup and cheap test | Short-run candidate selection |
+| --- | --- |
+| [![Cheap-test results showing circle packing, evaluation metrics, and a critique](docs/screenshots/setup-and-test.png)](docs/screenshots/setup-and-test.png) | [![Four short-run candidate cards with constructions, scores, summaries, and promotion controls](docs/screenshots/short-runs.png)](docs/screenshots/short-runs.png) |
+| **Evolution tree and candidate inspection** | **Versioning and diagnosis** |
+| [![Zoomed evolution tree showing candidate constructions, invalid programs, and an AI strategy summary](docs/screenshots/evolution-tree.png)](docs/screenshots/evolution-tree.png) | [![Versioning workspace with a human version tree, diagnosis chat, candidate tree, and program snapshot](docs/screenshots/versioning.png)](docs/screenshots/versioning.png) |
+| **Draft proposal review** | **Version comparison and code diff** |
+| [![Draft proposal drawer with proposed changes and controls to view the diff, test, accept, or cancel](docs/screenshots/draft-proposal.png)](docs/screenshots/draft-proposal.png) | [![Comparison of baseline and explore versions with metric changes and highlighted code additions](docs/screenshots/version-comparison.png)](docs/screenshots/version-comparison.png) |
+
+[Frame timestamps and source details](docs/screenshots/README.md).
+
+---
+
 ## Stack
 
 - **Backend:** Flask (Python 3.10+), REST + **Server-Sent Events** for live
